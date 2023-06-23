@@ -41,49 +41,6 @@ namespace implementation {
 
 using RequestStatus = android::hardware::biometrics::fingerprint::V2_1::RequestStatus;
 
-/*
- * Write value to path and close file.
- */
-template <typename T>
-static void set(const std::string& path, const T& value) {
-    std::ofstream file(path);
-
-    if (!file) {
-        PLOG(ERROR) << "Failed to open: " << path;
-        return;
-    }
-
-    LOG(DEBUG) << "write: " << path << " value: " << value;
-
-    file << value << std::endl;
-
-    if (!file) {
-        PLOG(ERROR) << "Failed to write: " << path << " value: " << value;
-    }
-}
-
-template <typename T>
-static T get(const std::string& path, const T& def) {
-    std::ifstream file(path);
-
-    if (!file) {
-        PLOG(ERROR) << "Failed to open: " << path;
-        return def;
-    }
-
-    T result;
-
-    file >> result;
-
-    if (file.fail()) {
-        PLOG(ERROR) << "Failed to read: " << path;
-        return def;
-    } else {
-        LOG(DEBUG) << "read: " << path << " value: " << result;
-        return result;
-    }
-}
-
 BiometricsFingerprint* BiometricsFingerprint::sInstance = nullptr;
 
 BiometricsFingerprint::BiometricsFingerprint() : mClientCallback(nullptr) {
@@ -91,11 +48,6 @@ BiometricsFingerprint::BiometricsFingerprint() : mClientCallback(nullptr) {
     if (!openHal()) {
         LOG(ERROR) << "Can't open HAL module";
     }
-
-    std::ifstream in("/sys/devices/virtual/fingerprint/fingerprint/position");
-    mIsUdfps = !!in;
-    if (in)
-        in.close();
 
 #ifdef HAS_FINGERPRINT_GESTURES
     request(FINGERPRINT_REQUEST_NAVIGATION_MODE_START, 1);
@@ -134,6 +86,36 @@ BiometricsFingerprint::BiometricsFingerprint() : mClientCallback(nullptr) {
 #endif
 }
 
+/*
+ * Write value to path and close file.
+ */
+template <typename T>
+static void set(const std::string& path, const T& value) {
+    std::ofstream file(path);
+
+    if (!file) {
+        PLOG(ERROR) << "Failed to open: " << path;
+        return;
+    }
+
+    LOG(DEBUG) << "write: " << path << " value: " << value;
+
+    file << value << std::endl;
+
+    if (!file) {
+        PLOG(ERROR) << "Failed to write: " << path << " value: " << value;
+    }
+}
+
+template <typename T>
+static T get(const std::string& path, const T& def) {
+    std::ifstream file(path);
+    T result;
+
+    file >> result;
+    return file.fail() ? def : result;
+}
+
 BiometricsFingerprint::~BiometricsFingerprint() {
     if (ss_fingerprint_close() != 0) {
         LOG(ERROR) << "Can't close HAL module";
@@ -141,22 +123,21 @@ BiometricsFingerprint::~BiometricsFingerprint() {
 }
 
 Return<bool> BiometricsFingerprint::isUdfps(uint32_t) {
-    return mIsUdfps;
+    return true;
 }
 
 Return<void> BiometricsFingerprint::onFingerDown(uint32_t, uint32_t, float, float) {
-#ifdef HAS_OPTICAL_UDFPS
-    request(SEM_REQUEST_TOUCH_EVENT, 2);
-    set("/sys/class/lcd/panel/mask_brightness", 486);
-#endif
+    mPreviousBrightness = get<std::string>(SEM_BRIGHTNESS_PATH, "");
+    set(SEM_BRIGHTNESS_PATH, "319");
     return Void();
 }
 
 Return<void> BiometricsFingerprint::onFingerUp() {
-#ifdef HAS_OPTICAL_UDFPS
-    set("/sys/class/lcd/panel/mask_brightness", 0);
-    request(SEM_REQUEST_TOUCH_EVENT, 1);
-#endif
+    if (!mPreviousBrightness.empty()) {
+        set(SEM_BRIGHTNESS_PATH, mPreviousBrightness);
+        mPreviousBrightness = "";
+    }
+
     return Void();
 }
 
@@ -270,17 +251,10 @@ Return<RequestStatus> BiometricsFingerprint::enroll(const hidl_array<uint8_t, 69
                                                     uint32_t gid, uint32_t timeoutSec) {
     const hw_auth_token_t* authToken = reinterpret_cast<const hw_auth_token_t*>(hat.data());
 
-#ifdef REQUEST_FORCE_CALIBRATE
-    request(SEM_REQUEST_FORCE_CBGE, 1);
-#endif
-
     return ErrorFilter(ss_fingerprint_enroll(authToken, gid, timeoutSec));
 }
 
 Return<RequestStatus> BiometricsFingerprint::postEnroll() {
-#ifdef HAS_OPTICAL_UDFPS
-    set("/sys/class/lcd/panel/mask_brightness", 0);
-#endif
     return ErrorFilter(ss_fingerprint_post_enroll());
 }
 
@@ -298,10 +272,6 @@ Return<RequestStatus> BiometricsFingerprint::cancel() {
         msg.data.error = FINGERPRINT_ERROR_CANCELED;
         notify(&msg);
     }
-#endif
-
-#ifdef HAS_OPTICAL_UDFPS
-    set("/sys/class/lcd/panel/mask_brightness", 0);
 #endif
 
     return ErrorFilter(ret);
@@ -468,7 +438,6 @@ void BiometricsFingerprint::notify(const fingerprint_msg_t* msg) {
                          .isOk()) {
                     LOG(ERROR) << "failed to invoke fingerprint onAuthenticated callback";
                 }
-                getInstance()->onFingerUp();
             } else {
                 // Not a recognized fingerprint
                 if (!thisPtr->mClientCallback
@@ -498,7 +467,7 @@ void BiometricsFingerprint::handleEvent(int eventCode) {
     switch (eventCode) {
 #ifdef HAS_FINGERPRINT_GESTURES
         case SEM_FINGERPRINT_EVENT_GESTURE_SWIPE_DOWN:
-        case SEM_FINGERPRINT_EVENT_GESTURE_SWIPE_UP:
+        case SEM_FINGERPRINT_EVENT_GESTURE_SWIPE_UP: {
             struct input_event event {};
             int keycode = eventCode == SEM_FINGERPRINT_EVENT_GESTURE_SWIPE_UP ?
                           KEY_UP : KEY_DOWN;
@@ -537,9 +506,23 @@ void BiometricsFingerprint::handleEvent(int eventCode) {
             if (write(uinputFd, &event, sizeof(event)) < 0) {
                 LOG(ERROR) << "Write EV_SYN to uinput node failed";
                 return;
-            }
-        break;
+            }  
+        } break;
 #endif
+        case SEM_FINGERPRINT_EVENT_CAPTURE_STARTED: {
+            set(SEM_TSP_CMD_PATH, SEM_TSP_FOD_ENABLE);
+            if (request(SEM_REQUEST_TOUCH_EVENT, SEM_FINGERPRINT_PARAM_PRESSED)) {
+                LOG(ERROR) << "Request vendor touch event paramPressed failed";
+                return;
+            }
+        } break;
+        case SEM_FINGERPRINT_EVENT_CAPTURE_READY: {
+            if (request(SEM_REQUEST_TOUCH_EVENT, SEM_FINGERPRINT_PARAM_RELEASED)) {
+                LOG(ERROR) << "Request vendor touch event paramReleased failed";
+                return;
+            }
+            set(SEM_TSP_CMD_PATH, SEM_TSP_FOD_DISABLE);
+        } break;
     }
 }
 
